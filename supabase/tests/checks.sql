@@ -1,0 +1,495 @@
+-- =============================================================================
+-- GRIT Layover - tests/checks.sql
+-- Proves the rules hold. Run AFTER 001-004 and seed.sql.
+--
+-- How the rollback works:
+--   All checks run inside one plpgsql block (a transaction / subtransaction).
+--   The block ends by raising a sentinel error, which ROLLS BACK every change
+--   the checks made. Results are copied into a variable first, so they survive
+--   and are returned as a PASS/FAIL table.
+--   This is done instead of BEGIN ... ROLLBACK because the Supabase SQL Editor
+--   only displays the last statement's result and does not show RAISE NOTICE
+--   output. Here the last statement IS the result grid. (In psql the NOTICE
+--   lines are printed too.)
+--
+-- Limits, stated honestly:
+--   * Check 1 runs two book_slot calls one after the other in one session. It
+--     proves the guards exist; true concurrency is covered by the slot row lock
+--     and the partial unique index, which a single script cannot race.
+--   * Check 12 backdates recorded_at by one day, because now() cannot be moved
+--     inside a transaction.
+-- =============================================================================
+
+create temp table if not exists grit_check_results (
+  check_no int, check_name text, result text, detail text
+);
+truncate grit_check_results;
+
+-- ---------------------------------------------------------------- helpers ----
+create or replace function pg_temp.report(p_no int, p_name text, p_passed boolean, p_detail text default null)
+returns void language plpgsql as $$
+begin
+  insert into grit_check_results
+  values (p_no, p_name, case when p_passed then 'PASS' else 'FAIL' end, p_detail);
+  raise notice '% check %: % %', case when p_passed then 'PASS' else 'FAIL' end, p_no, p_name,
+               coalesce('(' || p_detail || ')', '');
+end;
+$$;
+
+-- Runs p_sql and expects it to fail with an error matching p_pattern.
+-- Returns 'OK: <error>' on the expected failure, anything else otherwise.
+-- If the statement unexpectedly SUCCEEDS, its effects are undone too, so one
+-- broken rule cannot contaminate the checks that run after it.
+create or replace function pg_temp.expect_error(p_sql text, p_pattern text)
+returns text language plpgsql as $$
+begin
+  execute p_sql;
+  raise exception 'expect_error: no error';
+exception when others then
+  if sqlerrm = 'expect_error: no error' then return 'NO ERROR: statement succeeded (effects undone)'; end if;
+  if sqlerrm ~* p_pattern then return 'OK: ' || sqlerrm; end if;
+  return 'WRONG ERROR: ' || sqlerrm;
+end;
+$$;
+
+create or replace function pg_temp.sid(p_name text) returns uuid language sql stable as
+  $$ select id from students where name = p_name $$;
+create or replace function pg_temp.iid(p_name text) returns uuid language sql stable as
+  $$ select id from interviewers where name = p_name $$;
+create or replace function pg_temp.bid(p_track text, p_level text) returns uuid language sql stable as
+  $$ select id from badges where track = p_track and level = p_level $$;
+create or replace function pg_temp.miles(p_student uuid) returns int language sql stable as
+  $$ select coalesce(sum(amount), 0)::int from miles_ledger where student_id = p_student $$;
+
+-- Clears the AI Product Specialist skills for a student (contest-system path).
+create or replace function pg_temp.give_specialist_skills(p_student uuid) returns void language plpgsql as $$
+begin
+  perform record_skill_result(p_student, (select id from skills where name = 'Computational Thinking'), 2, 'gold', 80, 'system', 'checks');
+  perform record_skill_result(p_student, (select id from skills where name = 'Applied Gen AI Development'), 2, 'gold', 80, 'system', 'checks');
+  perform record_skill_result(p_student, (select id from skills where name = 'Server-Side Engineering'), 1, 'gold', 10, 'system', 'checks');
+  perform record_skill_result(p_student, (select id from skills where name = 'SQL'), 1, 'gold', 10, 'system', 'checks');
+end;
+$$;
+
+-- A past slot + booking inserted directly (as the seed does), owned by p_interviewer.
+create or replace function pg_temp.past_booking(p_student uuid, p_badge uuid, p_interviewer uuid, p_starts_at timestamptz)
+returns uuid language plpgsql as $$
+declare v_slot uuid; v_booking uuid;
+begin
+  insert into slots (interviewer_id, starts_at, ends_at)
+  values (p_interviewer, p_starts_at, p_starts_at + interval '30 minutes') returning id into v_slot;
+  insert into bookings (student_id, badge_id, slot_id) values (p_student, p_badge, v_slot) returning id into v_booking;
+  return v_booking;
+end;
+$$;
+
+-- ----------------------------------------------------------------- checks ----
+create or replace function pg_temp.grit_checks()
+returns table (check_no int, check_name text, result text, detail text)
+language plpgsql as $$
+declare
+  v_out        jsonb;
+  v_r          text;
+  v_r2         text;
+  v_ok         boolean;
+  v_n          int;
+  v_id         uuid;
+  v_free       uuid[];
+  v_tester     uuid;   -- a private interviewer, so test slots never collide with seeded ones
+  v_priya      uuid := pg_temp.sid('Priya Sharma');
+  v_arjun      uuid := pg_temp.sid('Arjun Reddy');
+  v_kavya      uuid := pg_temp.sid('Kavya Nair');
+  v_vikram     uuid := pg_temp.sid('Vikram Singh');
+  v_aditya     uuid := pg_temp.sid('Aditya Kulkarni');
+  v_sneha      uuid := pg_temp.sid('Sneha Iyer');
+  v_novice     uuid := pg_temp.bid('AI Product Mastery', 'Novice');
+  v_specialist uuid := pg_temp.bid('AI Product Mastery', 'Specialist');
+  v_ananya     uuid := pg_temp.iid('Ananya Rao');
+  v_booking    uuid;
+  v_result     uuid;
+  v_award      uuid;
+  v_award2     uuid;
+  v_case       uuid;
+  v_deadline   date;
+begin
+  if v_priya is null then
+    raise exception 'Seed data not found. Run supabase/seed.sql before the checks.';
+  end if;
+
+  begin  -- everything in here is rolled back at the end
+    -- Keep the suite independent of the calendar: if the real badge deadline
+    -- has passed, pretend it has not (check 23 simulates it explicitly).
+    update program_settings set badge_deadline = ist_today() + 30 where id = 1 and badge_deadline < ist_today();
+    select array_agg(slot_id order by starts_at, slot_id) into v_free from available_slots;
+    insert into interviewers (name, email) values ('Check Interviewer', 'checks@grit.example')
+      returning id into v_tester;
+
+    -- ===== Seed-state checks first (later checks change these students) =====
+
+    -- 13. Every demo student shows the journey state the seed promises.
+    select string_agg(format('%s: expected %s, got %s', e.name, e.state, coalesce(j.state, 'none')), '; ')
+      into v_r
+    from (values ('Priya Sharma', 'AI Product Mastery', 'Ready to book'),
+                 ('Arjun Reddy', 'AI Product Mastery', 'Not ready'),
+                 ('Sneha Iyer', 'AI Product Mastery', 'Booked'),
+                 ('Rahul Verma', 'AI Product Mastery', 'Waiting for result'),
+                 ('Kavya Nair', 'AI Product Mastery', 'Retake later'),
+                 ('Vikram Singh', 'AI Product Mastery', 'Passed'),
+                 ('Meera Joshi', 'AI Product Mastery', 'Not eligible'),
+                 ('Aditya Kulkarni', 'AI Product Mastery', 'Under review'),
+                 ('Rohan Das', 'AI Robotics Mastery', 'Project pending'),
+                 ('Ishita Gupta', 'AI Product Mastery', 'Revoked')) as e(name, track, state)
+    left join student_journey j on j.student_name = e.name and j.track = e.track and j.level = 'Novice'
+    where j.state is distinct from e.state;
+    perform pg_temp.report(13, 'Seeded students show their intended journey states', v_r is null, v_r);
+
+    -- 14. Medal upgrade: Kavya CT L1 try_again then silver -> +5 then +13 (= 18).
+    select string_agg(format('%s %s', amount, reason), ', ' order by effective_at) into v_r
+    from miles_ledger
+    where student_id = v_kavya and reason in ('skill_medal', 'medal_upgrade') and note like 'Computational Thinking L1%';
+    perform pg_temp.report(14, 'Medal upgrade credits only the difference (+5, +13)',
+                           v_r = '5 skill_medal, 13 medal_upgrade', v_r);
+
+    -- 15. Open case: Aditya still ranks normally; journey flags final steps on hold.
+    select count(*) into v_n from leaderboard l
+    where l.student_id = v_aditya and l.is_qualiflyer and l.total_miles = 250;
+    select bool_and(final_steps_on_hold) into v_ok from student_journey where student_id = v_aditya;
+    perform pg_temp.report(15, 'Student with open case stays on leaderboard, final steps on hold',
+                           v_n = 1 and v_ok, format('leaderboard rows=%s, on_hold=%s', v_n, v_ok));
+
+    -- 16. Ishita's cascade from the seed: Novice and Specialist revoked, Miles = skill Miles only.
+    select count(*) into v_n from badge_awards where student_id = pg_temp.sid('Ishita Gupta') and status = 'revoked';
+    select string_agg(amount::text, ',' order by amount) into v_r
+    from miles_ledger where student_id = pg_temp.sid('Ishita Gupta') and reason = 'badge_revoked';
+    perform pg_temp.report(16, 'Seeded malpractice cascade revoked both badges (-250, -150)',
+                           v_n = 2 and v_r = '-250,-150', format('revoked=%s, debits=%s', v_n, v_r));
+
+    -- ===== The 12 required checks =====
+
+    -- 1. Double booking: the second booker of a slot is refused.
+    perform record_skill_result(v_arjun, (select id from skills where name = 'UI Engineering'), 2, 'gold', 40, 'system', 'checks');
+    v_booking := book_slot(v_arjun, v_novice, v_free[1], 'student', v_arjun::text);
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_priya, v_novice, v_free[1], 'student', v_priya),
+      'just booked by someone else');
+    perform pg_temp.report(1, 'Second book_slot on the same slot fails', v_booking is not null and v_r like 'OK:%', v_r);
+
+    -- 2. Overlapping open slots for one interviewer are rejected (raw insert and via create_slot).
+    v_r := pg_temp.expect_error(
+      format($q$insert into slots (interviewer_id, starts_at, ends_at)
+                select interviewer_id, starts_at + interval '15 minutes', ends_at + interval '15 minutes'
+                from slots where id = %L$q$, v_free[2]),
+      'slots_no_overlap');
+    v_r2 := pg_temp.expect_error(
+      format('select create_slot(s.interviewer_id, s.starts_at + interval ''10 minutes'', ''admin'', ''checks'') from slots s where s.id = %L', v_free[2]),
+      'overlapping');
+    perform pg_temp.report(2, 'Overlapping slot for the same interviewer fails',
+                           v_r like 'OK:%' and v_r2 like 'OK:%', v_r || ' | ' || v_r2);
+
+    -- 3. The ledger is append-only.
+    v_r  := pg_temp.expect_error('update miles_ledger set amount = amount + 1', 'append-only');
+    v_r2 := pg_temp.expect_error('delete from miles_ledger', 'append-only');
+    perform pg_temp.report(3, 'UPDATE and DELETE on miles_ledger fail',
+                           v_r like 'OK:%' and v_r2 like 'OK:%', v_r || ' | ' || v_r2);
+
+    -- 4. Past slot and a slot inside the 2-hour notice window are refused.
+    insert into slots (interviewer_id, starts_at, ends_at)
+    values (v_tester, now() - interval '1 day', now() - interval '1 day' + interval '30 minutes') returning id into v_id;
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_priya, v_novice, v_id, 'student', v_priya), 'already started');
+    v_id := create_slot(v_tester, now() + interval '1 hour', 'admin', 'checks');
+    v_r2 := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_priya, v_novice, v_id, 'student', v_priya), 'at least 2 hours');
+    perform pg_temp.report(4, 'Booking a past slot or one inside the notice window fails',
+                           v_r like 'OK:%' and v_r2 like 'OK:%', v_r || ' | ' || v_r2);
+
+    -- 5. No skipping: Specialist without an active Novice.
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_priya, v_specialist, v_free[3], 'student', v_priya),
+      'Earn AI Product Mastery Novice first');
+    perform pg_temp.report(5, 'Booking Specialist without an active Novice fails', v_r like 'OK:%', v_r);
+
+    -- 6. Retake cooldown: Kavya failed 2 days ago, retake_after is in 3 days.
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_kavya, v_novice, v_free[3], 'student', v_kavya),
+      'retake');
+    perform pg_temp.report(6, 'Booking during the retake_after cooldown fails', v_r like 'OK:%', v_r);
+
+    -- 7. Confirmed case on Novice while Specialist is active -> cascade.
+    perform pg_temp.give_specialist_skills(v_vikram);
+    v_booking := pg_temp.past_booking(v_vikram, v_specialist, v_tester, now() - interval '1 day 2 hours');
+    v_result := record_result(v_booking, v_tester, 'pass', 'Strong', 'interviewer', v_tester::text);
+    select id into v_award from badge_awards where student_id = v_vikram and badge_id = v_novice and status = 'active';
+    select id into v_award2 from badge_awards where result_id = v_result;
+    v_case := flag_malpractice(v_award, 'Test evidence', 'admin', 'checks-admin');
+    perform decide_case(v_case, 'confirmed', 'Test confirmation', 'admin', 'checks-admin');
+    select count(*) into v_n from badge_awards
+    where (id = v_award and status = 'revoked' and revoke_cause = 'malpractice')
+       or (id = v_award2 and status = 'revoked' and revoke_cause = 'prerequisite_revoked' and caused_by_award_id = v_award);
+    select string_agg(amount::text, ',' order by amount) into v_r
+    from miles_ledger where student_id = v_vikram and reason = 'badge_revoked';
+    perform pg_temp.report(7, 'Confirmed Novice case revokes Novice + Specialist, -150 and -250, audited',
+      v_n = 2 and v_r = '-250,-150'
+        and (select count(*) from audit_log where table_name = 'badge_awards' and record_id in (v_award::text, v_award2::text)
+               and action = 'UPDATE' and actor_role = 'admin' and after ->> 'status' = 'revoked') = 2
+        and (select count(*) from audit_log where table_name = 'miles_ledger' and actor_role = 'admin'
+               and after ->> 'reason' = 'badge_revoked' and after ->> 'student_id' = v_vikram::text) = 2
+        and not (select conduct_ok from students where id = v_vikram),
+      format('revoked=%s, debits=%s', v_n, v_r));
+
+    -- 8. Leaderboard and interviewer_schedule never touch malpractice_cases,
+    --    directly or through any view they depend on (walks pg_depend recursively).
+    with recursive deps(oid) as (
+      select unnest(array['public.leaderboard'::regclass::oid, 'public.interviewer_schedule'::regclass::oid])
+      union
+      select d.refobjid
+      from deps
+      join pg_rewrite rw on rw.ev_class = deps.oid
+      join pg_depend d   on d.classid = 'pg_rewrite'::regclass and d.objid = rw.oid
+                        and d.refclassid = 'pg_class'::regclass and d.refobjid <> deps.oid
+    )
+    select exists (select 1 from deps where oid = 'public.malpractice_cases'::regclass) into v_ok;
+    v_ok := not v_ok
+            and pg_get_viewdef('public.leaderboard'::regclass) !~* 'malpractice'
+            and pg_get_viewdef('public.interviewer_schedule'::regclass) !~* 'malpractice';
+    perform pg_temp.report(8, 'leaderboard and interviewer_schedule do not reference malpractice_cases', v_ok);
+
+    -- 9 + 10. Priya: 100 Miles -> pass recorded 2 days after the interview -> 250,
+    --         and the badge is dated by the interview, not by the recording.
+    v_n := pg_temp.miles(v_priya);
+    v_booking := pg_temp.past_booking(v_priya, v_novice, v_tester, now() - interval '2 days 1 hour');
+    v_result := record_result(v_booking, v_tester, 'pass', 'Great demo', 'interviewer', v_tester::text);
+    perform pg_temp.report(9, 'Priya Miles 100 before pass, 250 after',
+                           v_n = 100 and pg_temp.miles(v_priya) = 250,
+                           format('before=%s, after=%s', v_n, pg_temp.miles(v_priya)));
+    select a.awarded_at = r.interview_held_at and r.recorded_at - r.interview_held_at >= interval '2 days'
+      into v_ok
+    from badge_awards a join interview_results r on r.id = a.result_id
+    where r.id = v_result;
+    perform pg_temp.report(10, 'awarded_at = interview_held_at even when recorded 2 days later', v_ok);
+
+    -- 11. An open malpractice case does not block booking the next badge.
+    perform pg_temp.give_specialist_skills(v_aditya);
+    v_r := 'booked';
+    begin
+      v_id := book_slot(v_aditya, v_specialist, v_free[3], 'student', v_aditya::text);
+    exception when others then v_r := sqlerrm;
+    end;
+    perform pg_temp.report(11, 'Student with an open case can still book their next badge', v_r = 'booked', v_r);
+
+    -- 12. Interviewer correction is same-day only; admin can correct any time.
+    select id into v_result from interview_results where student_id = v_kavya and badge_id = v_novice;
+    update interview_results set recorded_at = recorded_at - interval '1 day' where id = v_result;
+    v_r := pg_temp.expect_error(
+      format('select correct_result(%L, %L, %L, %L, %L)', v_result, 'pass', 'Misread rubric', 'interviewer', v_ananya),
+      'only on the day it was recorded');
+    v_r2 := 'ok';
+    begin
+      perform correct_result(v_result, 'pass', 'Rubric re-checked by admin', 'admin', 'checks-admin');
+    exception when others then v_r2 := sqlerrm;
+    end;
+    perform pg_temp.report(12, 'correct_result next day: interviewer fails, admin works',
+      v_r like 'OK:%' and v_r2 = 'ok'
+        and exists (select 1 from badge_awards where result_id = v_result and status = 'active'),
+      v_r || ' | admin: ' || v_r2);
+
+    -- ===== Extra guarantees =====
+
+    -- 17. Reschedule is atomic: a failed move leaves the old booking active;
+    --     a good move cancels the old one and links the new one to it.
+    select id into v_booking from bookings where student_id = v_sneha and status = 'active';
+    v_r := pg_temp.expect_error(
+      format('select reschedule_booking(%L, %L, %L, %L)', v_booking, v_free[1], 'student', v_sneha), 'just booked');
+    v_ok := (select status from bookings where id = v_booking) = 'active';
+    v_id := reschedule_booking(v_booking, v_free[4], 'student', v_sneha::text);
+    v_ok := v_ok and v_r like 'OK:%'
+            and (select status from bookings where id = v_booking) = 'cancelled'
+            and (select rescheduled_from_id from bookings where id = v_id) = v_booking;
+    perform pg_temp.report(17, 'Reschedule is all-or-nothing and linked by rescheduled_from_id', v_ok, v_r);
+
+    -- 18. Withdrawing a booked slot cancels the booking as 'interviewer'.
+    perform withdraw_slot(v_free[4], (select interviewer_id from slots where id = v_free[4]), 'Unwell',
+                          'interviewer', (select interviewer_id from slots where id = v_free[4])::text);
+    perform pg_temp.report(18, 'withdraw_slot cancels the active booking with cancelled_by = interviewer',
+      (select status = 'cancelled' and cancelled_by = 'interviewer' from bookings where id = v_id));
+
+    -- 19. Grants: anon can read reference data and views, call public functions,
+    --     but cannot touch cases, the audit log, internal functions or any table write.
+    v_ok := not has_table_privilege('anon', 'public.malpractice_cases', 'select')
+        and not has_table_privilege('anon', 'public.audit_log', 'select')
+        and not has_table_privilege('anon', 'public.miles_ledger', 'insert')
+        and not has_table_privilege('anon', 'public.bookings', 'select')
+        and has_table_privilege('anon', 'public.leaderboard', 'select')
+        and has_function_privilege('anon', 'public.book_slot(uuid,uuid,uuid,text,text)', 'execute')
+        and not has_function_privilege('anon', 'public._revoke_award(uuid,text,text,text,text,uuid)', 'execute')
+        and not has_function_privilege('anon', 'public._create_booking(uuid,uuid,uuid,uuid)', 'execute');
+    -- Then act as anon for real. (No pg_temp helpers in here: anon may not
+    -- be allowed to use this session's temp schema.)
+    v_r := 'anon:';
+    begin
+      execute 'set local role anon';
+      select count(*) into v_n from badges;             -- RLS policy lets reference rows through
+      v_ok := v_ok and v_n = 20;
+      v_r := v_r || format(' badges=%s', v_n);
+      select count(*) into v_n from student_journey;    -- views work for anon
+      v_ok := v_ok and v_n > 0;
+      begin
+        perform count(*) from malpractice_cases;
+        v_ok := false; v_r := v_r || ' | cases READABLE';
+      exception when insufficient_privilege then v_r := v_r || ' | cases denied';
+      end;
+      begin
+        insert into miles_ledger (student_id, amount, reason, effective_at) values (v_priya, 1000, 'bonus_milestone', now());
+        v_ok := false; v_r := v_r || ' | ledger WRITABLE';
+      exception when insufficient_privilege then v_r := v_r || ' | ledger insert denied';
+      end;
+      begin                                             -- callable, and its rules run
+        perform book_slot(gen_random_uuid(), v_novice, gen_random_uuid(), 'admin', 'checks-admin');
+        v_ok := false;
+      exception when others then
+        v_ok := v_ok and sqlerrm = 'Student not found.';
+        v_r := v_r || ' | book_slot: ' || sqlerrm;
+      end;
+      execute 'reset role';
+    exception when others then
+      execute 'reset role';
+      v_ok := false; v_r := v_r || ' | unexpected: ' || sqlerrm;
+    end;
+    perform pg_temp.report(19, 'anon: reads views + reference data, no cases/audit/table writes', v_ok, v_r);
+
+    -- 20. A case's review deadline is fixed at creation: changing the setting
+    --     does not move it, and it cannot be edited. Overdue cases reach admins.
+    select id into v_case from malpractice_cases where student_id = v_aditya and status = 'open';
+    update program_settings set review_limit_days = 1 where id = 1;
+    v_ok := (select review_due_at = flagged_at + interval '7 days' from malpractice_cases where id = v_case);
+    v_r := pg_temp.expect_error(
+      format('update malpractice_cases set review_due_at = now() + interval ''30 days'' where id = %L', v_case),
+      'fixed when it is opened');
+    -- Simulate time passing: a case flagged 10 days ago under the new 1-day limit is 9 days overdue.
+    insert into malpractice_cases (student_id, badge_award_id, flagged_by, flagged_at, evidence)
+    select student_id, id, 'checks', now() - interval '10 days', 'Old flag'
+    from badge_awards where student_id = v_priya and status = 'active';
+    v_ok := v_ok and v_r like 'OK:%'
+            and exists (select 1 from admin_overdue_cases where student_id = v_priya and days_overdue = 9)
+            and not exists (select 1 from admin_overdue_cases where case_id = v_case);
+    perform pg_temp.report(20, 'Case review deadline fixed at creation; overdue cases reach admins', v_ok, v_r);
+
+    -- 21. Result corrected -> can rebook any time. Priya's pass (check 9) is
+    --     corrected to fail: badge revoked, -150, no cooldown, books at once.
+    select id into v_result from interview_results
+    where student_id = v_priya and badge_id = v_novice and outcome = 'pass';
+    v_r := pg_temp.expect_error(
+      format('select correct_result(%L, %L, %L, %L, %L, %L::date)',
+             v_result, 'fail', 'Rubric misread', 'admin', 'checks-admin', ist_today() + 3),
+      'can rebook any time');
+    perform correct_result(v_result, 'fail', 'Rubric misread', 'admin', 'checks-admin');
+    v_ok := v_r like 'OK:%'
+      and (select retake_after is null from interview_results where id = v_result)
+      and (select revoke_cause = 'result_corrected' from badge_awards where result_id = v_result)
+      and pg_temp.miles(v_priya) = 100
+      and (select state from student_journey where student_id = v_priya and badge_id = v_novice) = 'Ready to book';
+    v_r2 := 'booked';
+    begin
+      perform book_slot(v_priya, v_novice, v_free[5], 'student', v_priya::text);
+    exception when others then v_r2 := sqlerrm;
+    end;
+    perform pg_temp.report(21, 'Corrected pass: badge revoked, no cooldown, can rebook at once',
+                           v_ok and v_r2 = 'booked', v_r || ' | rebook: ' || v_r2);
+
+    -- 22. Malpractice -> rebooking only after an admin restores eligibility.
+    --     Vikram's Novice + Specialist were revoked for malpractice in check 7.
+    v_ok := (select state from student_journey where student_id = v_vikram and badge_id = v_novice) = 'Revoked';
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_vikram, v_novice, v_free[6], 'student', v_vikram),
+      'admin must restore your eligibility');
+    v_r2 := pg_temp.expect_error(
+      format('select restore_eligibility(%L, %L, %L, %L)', v_vikram, 'Apology accepted', 'interviewer', v_ananya),
+      'only available to: admin');
+    perform restore_eligibility(v_vikram, 'Suspension served; apology accepted', 'admin', 'checks-admin');
+    v_ok := v_ok and v_r like 'OK:%' and v_r2 like 'OK:%'
+      and (select conduct_ok from students where id = v_vikram)
+      and exists (select 1 from malpractice_cases where student_id = v_vikram and status = 'confirmed'
+                  and eligibility_restored_by = 'checks-admin' and restore_note is not null)
+      and (select status from badge_awards where id = v_award) = 'revoked'   -- badges stay revoked
+      and (select state from student_journey where student_id = v_vikram and badge_id = v_novice) = 'Ready to book'
+      and (select state from student_journey where student_id = v_vikram and badge_id = v_specialist) = 'Not ready'
+      and pg_temp.expect_error(
+            format('select restore_eligibility(%L, %L, %L, %L)', v_vikram, 'Again', 'admin', 'checks-admin'),
+            'nothing to restore') like 'OK:%';
+    v_r := v_r || ' | ' || v_r2;
+    v_r2 := 'booked';
+    begin
+      perform book_slot(v_vikram, v_novice, v_free[6], 'student', v_vikram::text);
+    exception when others then v_r2 := sqlerrm;
+    end;
+    perform pg_temp.report(22, 'Malpractice: rebooking blocked until an admin restores eligibility',
+                           v_ok and v_r2 = 'booked', v_r || ' | after restore: ' || v_r2);
+
+    -- 23. Badge deadline, simulated as having passed 3 days ago:
+    --     (a) Arjun holds no badge: "Not eligible" with the deadline reason, and book_slot refuses.
+    --     (b) Sneha's interview was held 4 days ago (before the deadline) but its result is
+    --         entered now (after it): the badge still qualifies, so her Specialist booking works.
+    select badge_deadline into v_deadline from program_settings where id = 1;
+    update program_settings set badge_deadline = ist_today() - 3 where id = 1;
+    v_booking := pg_temp.past_booking(v_sneha, v_novice, v_tester,
+                                      ((ist_today() - 4) + time '11:00') at time zone 'Asia/Kolkata');
+    v_result := record_result(v_booking, v_tester, 'pass', 'Held before the deadline', 'interviewer', v_tester::text);
+    perform pg_temp.give_specialist_skills(v_sneha);
+    v_r2 := 'booked';
+    begin
+      perform book_slot(v_sneha, v_specialist, v_free[7], 'student', v_sneha::text);
+    exception when others then v_r2 := sqlerrm;
+    end;
+    v_r := pg_temp.expect_error(
+      format('select book_slot(%L, %L, %L, %L, %L)', v_arjun, v_novice, v_free[8], 'student', v_arjun),
+      'You cannot book an interview: Missed the .* badge deadline');
+    v_ok := v_r like 'OK:%'
+      and (select state = 'Not eligible'
+                  and not_eligible_reason = format('Missed the %s badge deadline', to_char(ist_today() - 3, 'FMDD Mon'))
+           from student_journey where student_id = v_arjun and badge_id = v_novice)
+      and student_ineligibility_reason((select s from students s where s.id = v_sneha)) is null
+      and v_r2 = 'booked';
+    update program_settings set badge_deadline = v_deadline where id = 1;
+    perform pg_temp.report(23, 'Badge deadline: no badge -> blocked; badge from a pre-deadline interview still qualifies',
+                           v_ok, v_r || ' | qualified student''s Specialist booking: ' || v_r2);
+
+    -- 24. Disqualified students (conduct_ok = false) forfeit leaderboard standing
+    --     and reappear when an admin restores eligibility.
+    v_id := pg_temp.sid('Ishita Gupta');
+    v_ok := not exists (select 1 from leaderboard where student_id = v_id);
+    perform restore_eligibility(v_id, 'Appeal upheld', 'admin', 'checks-admin');
+    v_ok := v_ok and exists (select 1 from leaderboard where student_id = v_id);
+    perform pg_temp.report(24, 'Leaderboard leaves out disqualified students; restore brings them back', v_ok);
+
+    -- 25. Revoking a badge cancels active bookings for higher badges in the same track.
+    --     (a) An admin confirms Aditya's case: his Specialist booking (check 11) is cancelled by 'admin'.
+    --     (b) The interviewer corrects Sneha's Novice pass (check 23) on the same day: her
+    --         Specialist booking is cancelled by 'interviewer'.
+    select id into v_case from malpractice_cases where student_id = v_aditya and status = 'open';
+    perform decide_case(v_case, 'confirmed', 'Evidence reviewed', 'admin', 'checks-admin');
+    v_ok := (select status = 'cancelled' and cancelled_by = 'admin'
+                    and cancel_reason = 'Earlier badge (Novice) was revoked'
+             from bookings where student_id = v_aditya and badge_id = v_specialist);
+    perform correct_result(v_result, 'fail', 'Scored against the wrong rubric', 'interviewer', v_tester::text);
+    v_ok := v_ok and (select status = 'cancelled' and cancelled_by = 'interviewer'
+                             and cancel_reason = 'Earlier badge (Novice) was revoked'
+                      from bookings where student_id = v_sneha and badge_id = v_specialist);
+    perform pg_temp.report(25, 'Revoking a badge cancels higher-badge bookings in the track', coalesce(v_ok, false));
+
+    -- Keep the results, then undo everything the checks did.
+    select jsonb_agg(to_jsonb(r) order by r.check_no) into v_out from grit_check_results r;
+    raise exception 'grit_checks_rollback';
+  exception when others then
+    if sqlerrm <> 'grit_checks_rollback' then
+      raise exception 'Checks aborted by an unexpected error: % (results so far were rolled back)', sqlerrm;
+    end if;
+  end;
+
+  return query
+    select x.check_no, x.check_name, x.result, x.detail
+    from jsonb_to_recordset(v_out) as x(check_no int, check_name text, result text, detail text)
+    order by x.check_no;
+end;
+$$;
+
+select * from pg_temp.grit_checks();
