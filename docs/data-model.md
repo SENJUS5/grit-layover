@@ -550,9 +550,45 @@ Interviewer: their active and completed bookings by IST day, with any recorded o
 | `result_id` | uuid |  |  |
 | `outcome` | text |  |  |
 
+### `student_directory`
+
+Every student's name and track, for the app's "View as" picker. No eligibility or case data.
+
+| Column | Type | Not null | Notes |
+|---|---|---|---|
+| `student_id` | uuid |  |  |
+| `name` | text |  |  |
+| `primary_track` | grit_track |  |  |
+| `batch` | integer |  |  |
+| `campus` | text |  |  |
+| `section` | text |  |  |
+
+### `leaderboard_lists`
+
+GRIT's two lists: Qualiflyers (hold an active badge) and Pre-Qualiflyers (registered, no active badge yet), each ranked from 1 in the official leaderboard order. Built only on leaderboard, so it never sees malpractice cases.
+
+| Column | Type | Not null | Notes |
+|---|---|---|---|
+| `list` | text |  |  |
+| `list_rank` | integer |  |  |
+| `student_id` | uuid |  |  |
+| `name` | text |  |  |
+| `batch` | integer |  |  |
+| `campus` | text |  |  |
+| `section` | text |  |  |
+| `highest_badge` | text |  |  |
+| `total_miles` | integer |  |  |
+| `skill_depth` | integer |  |  |
+| `is_qualiflyer` | boolean |  |  |
+| `overall_rank` | integer |  |  |
+
 ## Functions
 
 Public functions are the only write path for the app. Internal helpers (prefixed `_`) are not listed and not granted.
+
+### `admin_active_awards(p_actor_role text, p_actor_id text)`
+
+Admin only. Every active badge, for flagging a malpractice case.
 
 ### `admin_audit_log(p_actor_role text, p_actor_id text, p_table text, p_record_id text, p_limit integer)`
 
@@ -590,6 +626,14 @@ Opens a malpractice case. The badge still counts; final steps wait. Review deadl
 
 Human-readable IST timestamp for error messages.
 
+### `interviewer_results(p_interviewer uuid, p_actor_role text, p_actor_id text)`
+
+Interviewer or admin. Results the interviewer recorded, newest first; can_correct_today mirrors correct_result's same-day rule.
+
+### `interviewer_slots(p_interviewer uuid, p_actor_role text, p_actor_id text)`
+
+Interviewer or admin. The interviewer's slots from today (IST) on: open, booked or withdrawn.
+
 ### `ist_date(p_ts timestamp with time zone)`
 
 Calendar date of a timestamp in Asia/Kolkata.
@@ -597,6 +641,10 @@ Calendar date of a timestamp in Asia/Kolkata.
 ### `ist_today()`
 
 Today in Asia/Kolkata. now() is fixed for a transaction, so this is too.
+
+### `project_review_queue(p_actor_role text, p_actor_id text)`
+
+Interviewer or admin. Robotics project submissions waiting for review, oldest first.
 
 ### `record_result(p_booking uuid, p_interviewer uuid, p_outcome text, p_feedback text, p_actor_role text, p_actor_id text, p_retake_after date, p_interview_held_at timestamp with time zone)`
 
@@ -618,9 +666,37 @@ Admin only. Lets a student book again after a confirmed malpractice case: conduc
 
 Approves or rejects a submitted project.
 
+### `student_bookings(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. Active bookings with their ids, so the app can cancel or reschedule them.
+
 ### `student_ineligibility_reason(p_student students)`
 
 Why a student may not book, or null if eligible: approval, attendance, hold, conduct, missed badge deadline. Used by book_slot and every view.
+
+### `student_last_change(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. The latest badge earned or removed, with Miles, list + rank and the deadline-badge condition before and after it.
+
+### `student_overview(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. Miles, leaderboard list and rank, and the trip checklist facts (attendance, registration, conduct, a badge by the deadline). The final interview round is not tracked yet; the app always shows it as pending.
+
+### `student_passbook(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. Every Miles row, newest first, with a running balance (seq 1 = oldest) and what it was for.
+
+### `student_projects(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. The latest project submission (if any) for every open badge that needs a project.
+
+### `student_requirements(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. For every open badge: each required skill level and whether the student has cleared it.
+
+### `student_timeline(p_student uuid, p_actor_role text, p_actor_id text)`
+
+Student or admin. Interview results (with feedback and retake date) and badge removals (cascades grouped), newest first. The app turns these into messages.
 
 ### `submit_project(p_student uuid, p_badge uuid, p_link text, p_actor_role text, p_actor_id text)`
 

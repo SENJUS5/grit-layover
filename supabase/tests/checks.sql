@@ -1,6 +1,6 @@
 -- =============================================================================
 -- GRIT Layover - tests/checks.sql
--- Proves the rules hold. Run AFTER 001-004 and seed.sql.
+-- Proves the rules hold. Run AFTER 001-005 and seed.sql.
 --
 -- How the rollback works:
 --   All checks run inside one plpgsql block (a transaction / subtransaction).
@@ -105,6 +105,11 @@ declare
   v_novice     uuid := pg_temp.bid('AI Product Mastery', 'Novice');
   v_specialist uuid := pg_temp.bid('AI Product Mastery', 'Specialist');
   v_ananya     uuid := pg_temp.iid('Ananya Rao');
+  v_rahul      uuid := pg_temp.sid('Rahul Verma');
+  v_karthik    uuid := pg_temp.iid('Karthik Menon');
+  v_snap       jsonb;  -- seed-state facts for checks 31 and 33
+  v_before     jsonb;
+  v_after      jsonb;
   v_booking    uuid;
   v_result     uuid;
   v_award      uuid;
@@ -164,6 +169,34 @@ begin
     from miles_ledger where student_id = pg_temp.sid('Ishita Gupta') and reason = 'badge_revoked';
     perform pg_temp.report(16, 'Seeded malpractice cascade revoked both badges (-250, -150)',
                            v_n = 2 and v_r = '-250,-150', format('revoked=%s, debits=%s', v_n, v_r));
+
+    -- 29. GRIT ranks each list on its own: Qualiflyers and Pre-Qualiflyers are
+    --     each numbered from 1. The _standing helper behind "what changed"
+    --     must place every student exactly where leaderboard_lists does.
+    select string_agg(format('%s: view %s #%s, helper %s #%s',
+                             s.name, lb.list, lb.list_rank, st.list, st.list_rank), '; ')
+      into v_r
+    from students s
+    left join leaderboard_lists lb on lb.student_id = s.id
+    cross join lateral _standing(s.id, '{}', s.is_registered_approved and s.conduct_ok) st
+    where (lb.list, lb.list_rank) is distinct from (st.list, st.list_rank);
+    select string_agg(format('%s %s', list, ranks), ' | ' order by list desc) into v_r2
+    from (select list, string_agg(list_rank::text, ',' order by list_rank) as ranks
+          from leaderboard_lists group by list) x;
+    v_ok := v_r is null
+      and v_r2 = 'Qualiflyers 1,2 | Pre-Qualiflyers 1,2,3,4,5,6,7'
+      and not exists (select 1 from leaderboard_lists where name = 'Ishita Gupta');
+    perform pg_temp.report(29, 'Each list ranked from 1; the what-changed helper matches leaderboard_lists',
+                           v_ok, coalesce(v_r, v_r2));
+
+    -- Seed-state facts for checks 31 and 33 (later checks change these students).
+    select jsonb_build_object(
+      'ishita_change', (select to_jsonb(c) from student_last_change(pg_temp.sid('Ishita Gupta'), 'admin', 'checks-admin') c),
+      'meera',  (select to_jsonb(o) from student_overview(pg_temp.sid('Meera Joshi'), 'admin', 'checks-admin') o),
+      'ishita', (select to_jsonb(o) from student_overview(pg_temp.sid('Ishita Gupta'), 'admin', 'checks-admin') o),
+      'vikram', (select to_jsonb(o) from student_overview(v_vikram, 'admin', 'checks-admin') o),
+      'priya',  (select to_jsonb(o) from student_overview(v_priya, 'admin', 'checks-admin') o))
+      into v_snap;
 
     -- ===== The 12 required checks =====
 
@@ -487,6 +520,156 @@ begin
         and (select actor_role = 'system' and actor_id is null
              from audit_log where table_name = 'interviewers' and action = 'INSERT' and record_id = v_probe::text);
     perform pg_temp.report(26, 'Audit actor is scoped to each function call', coalesce(v_ok, false));
+
+    -- ===== App reads (005) =====
+
+    -- 27. A student reads only their own data, an interviewer only theirs, an
+    --     admin anyone's. Internal helpers stay private even though Supabase
+    --     grants new functions to anon by default.
+    v_r := pg_temp.expect_error(
+      format('select * from student_passbook(%L, %L, %L)', v_priya, 'student', v_arjun),
+      'Students can only see their own data');
+    v_r2 := pg_temp.expect_error(
+      format('select * from student_passbook(%L, %L, %L)', v_priya, 'interviewer', v_ananya),
+      'only available to: student, admin');
+    v_ok := v_r like 'OK:%' and v_r2 like 'OK:%'
+      and pg_temp.expect_error(
+            format('select * from interviewer_results(%L, %L, %L)', v_ananya, 'interviewer', v_karthik),
+            'Interviewers can only see their own data') like 'OK:%'
+      and pg_temp.expect_error(
+            format('select * from admin_active_awards(%L, %L)', 'student', v_priya),
+            'only available to: admin') like 'OK:%'
+      and exists (select 1 from student_passbook(v_priya, 'student', v_priya::text))
+      and exists (select 1 from student_passbook(v_priya, 'admin', 'checks-admin'))
+      and exists (select 1 from interviewer_results(v_ananya, 'interviewer', v_ananya::text))
+      and has_table_privilege('anon', 'public.student_directory', 'select')
+      and has_table_privilege('anon', 'public.leaderboard_lists', 'select')
+      and not has_table_privilege('anon', 'public.student_directory', 'insert')
+      and has_function_privilege('anon', 'public.student_last_change(uuid,text,text)', 'execute')
+      and has_function_privilege('anon', 'public.project_review_queue(text,text)', 'execute')
+      and not has_function_privilege('anon', 'public._standing(uuid,uuid[],boolean)', 'execute')
+      and not has_function_privilege('anon', 'public._require_self_or_admin(text,text,text,uuid)', 'execute');
+    perform pg_temp.report(27, 'App reads: own data only (admins see all); helpers not granted', v_ok, v_r || ' | ' || v_r2);
+
+    -- 28. The passbook adds up: for every student it has one row per ledger
+    --     row, in date order (seq 1 = oldest), each balance is the sum so far,
+    --     and the last balance is their Miles, which the leaderboard shows too.
+    select string_agg(s.name, ', ') into v_r
+    from students s
+    left join leaderboard_lists lb on lb.student_id = s.id
+    left join lateral (
+      select count(*) as n,
+             (array_agg(x.balance order by x.seq desc))[1] as last_balance,
+             bool_and(x.balance = x.sum_so_far and x.effective_at >= coalesce(x.prev_at, x.effective_at)) as in_order
+      from (select p.seq, p.balance, p.effective_at,
+                   sum(p.amount) over (order by p.seq)    as sum_so_far,
+                   lag(p.effective_at) over (order by p.seq) as prev_at
+            from student_passbook(s.id, 'admin', 'checks-admin') p) x
+    ) pb on true
+    where pb.n <> (select count(*) from miles_ledger l where l.student_id = s.id)
+       or coalesce(pb.last_balance, 0) <> pg_temp.miles(s.id)
+       or not coalesce(pb.in_order, true)
+       or (lb.student_id is not null and lb.total_miles <> pg_temp.miles(s.id));
+    perform pg_temp.report(28, 'Passbook rows and running balance add up to the leaderboard Miles', v_r is null, v_r);
+
+    -- 30. What changed after a pass: Karthik records Rahul's result (the live
+    --     demo). "Before" must equal Rahul's real standing a moment earlier.
+    select to_jsonb(o) into v_before from student_overview(v_rahul, 'student', v_rahul::text) o;
+    v_ok := not exists (select 1 from student_last_change(v_rahul, 'student', v_rahul::text));
+    select id into v_booking from bookings where student_id = v_rahul and status = 'active';
+    v_result := record_result(v_booking, v_karthik, 'pass', 'Clear product thinking', 'interviewer', v_karthik::text);
+    select to_jsonb(c) into v_after from student_last_change(v_rahul, 'student', v_rahul::text) c;
+    v_ok := v_ok
+      and v_after ->> 'change' = 'badge_earned'
+      and v_after -> 'levels' = '["Novice"]'
+      and (v_after ->> 'miles_before')::int = (v_before ->> 'total_miles')::int
+      and (v_after ->> 'miles_after')::int
+          = (v_before ->> 'total_miles')::int + (select bonus_miles from badges where id = v_novice)
+      and v_after ->> 'list_before' = 'Pre-Qualiflyers'
+      and (v_after ->> 'rank_before')::int = (v_before ->> 'list_rank')::int
+      and v_after ->> 'list_after' = 'Qualiflyers'
+      and (v_after ->> 'rank_after')::int = (select list_rank from leaderboard_lists where student_id = v_rahul)
+      and not (v_after ->> 'deadline_badge_before')::boolean
+      and (v_after ->> 'deadline_badge_after')::boolean
+      and (select badge_by_deadline from student_overview(v_rahul, 'student', v_rahul::text));
+    perform pg_temp.report(30, 'What changed after a pass: +150 Miles, Pre-Qualiflyer -> Qualiflyer, badge ticked',
+      coalesce(v_ok, false),
+      format('Miles %s -> %s; %s #%s -> %s #%s', v_after ->> 'miles_before', v_after ->> 'miles_after',
+             v_after ->> 'list_before', v_after ->> 'rank_before', v_after ->> 'list_after', v_after ->> 'rank_after'));
+
+    -- 31. ...and after a removal: Karthik corrects that result to fail the same
+    --     day, so everything goes back. Ishita's seeded case (before check 24
+    --     restored her) is the cascade version: Novice and Specialist, -400
+    --     Miles, and off the leaderboard.
+    v_before := v_after;
+    perform correct_result(v_result, 'fail', 'Scored against the wrong rubric', 'interviewer', v_karthik::text);
+    select to_jsonb(c) into v_after from student_last_change(v_rahul, 'student', v_rahul::text) c;
+    v_ok := v_after ->> 'change' = 'badge_removed'
+      and v_after ->> 'cause' = 'result_corrected'
+      and (v_after ->> 'miles_before')::int = (v_before ->> 'miles_after')::int
+      and (v_after ->> 'miles_after')::int = (v_before ->> 'miles_before')::int
+      and v_after ->> 'list_before' = 'Qualiflyers'
+      and (v_after ->> 'rank_before')::int = (v_before ->> 'rank_after')::int
+      and v_after ->> 'list_after' = 'Pre-Qualiflyers'
+      and (v_after ->> 'rank_after')::int = (select list_rank from leaderboard_lists where student_id = v_rahul)
+      and (v_after ->> 'deadline_badge_before')::boolean
+      and not (v_after ->> 'deadline_badge_after')::boolean
+      and v_snap -> 'ishita_change' ->> 'change' = 'badge_removed'
+      and v_snap -> 'ishita_change' -> 'levels' = '["Novice", "Specialist"]'
+      and v_snap -> 'ishita_change' ->> 'cause' = 'malpractice'
+      and (v_snap -> 'ishita_change' ->> 'miles_before')::int - (v_snap -> 'ishita_change' ->> 'miles_after')::int = 400
+      and v_snap -> 'ishita_change' ->> 'list_before' = 'Qualiflyers'
+      and v_snap -> 'ishita_change' ->> 'list_after' is null
+      and (v_snap -> 'ishita_change' ->> 'deadline_badge_before')::boolean
+      and not (v_snap -> 'ishita_change' ->> 'deadline_badge_after')::boolean;
+    perform pg_temp.report(31, 'What changed after a removal, including the cascade version',
+      coalesce(v_ok, false),
+      format('Rahul: Miles %s -> %s; %s #%s -> %s #%s | Ishita: %s, Miles %s -> %s, %s -> %s',
+             v_after ->> 'miles_before', v_after ->> 'miles_after',
+             v_after ->> 'list_before', v_after ->> 'rank_before', v_after ->> 'list_after', v_after ->> 'rank_after',
+             v_snap -> 'ishita_change' ->> 'levels', v_snap -> 'ishita_change' ->> 'miles_before',
+             v_snap -> 'ishita_change' ->> 'miles_after', v_snap -> 'ishita_change' ->> 'list_before',
+             coalesce(v_snap -> 'ishita_change' ->> 'list_after', 'not listed')));
+
+    -- 32. Leaderboard and interviewer screens never read malpractice_cases:
+    --     not through leaderboard_lists (walking its view dependencies), and
+    --     not in the source of any 005 function those screens call (nor via
+    --     student_journey or admin_* objects, which do read cases).
+    with recursive deps(oid) as (
+      select 'public.leaderboard_lists'::regclass::oid
+      union
+      select d.refobjid
+      from deps
+      join pg_rewrite rw on rw.ev_class = deps.oid
+      join pg_depend d   on d.classid = 'pg_rewrite'::regclass and d.objid = rw.oid
+                        and d.refclassid = 'pg_class'::regclass and d.refobjid <> deps.oid
+    )
+    select not exists (select 1 from deps where oid = 'public.malpractice_cases'::regclass) into v_ok;
+    select count(*), string_agg(p.proname, ', ') filter (where p.prosrc ~* 'malpractice|student_journey|admin_')
+      into v_n, v_r
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in ('_standing', 'student_last_change', 'interviewer_slots',
+                        'interviewer_results', 'project_review_queue');
+    perform pg_temp.report(32, 'Leaderboard and interviewer reads never touch malpractice_cases',
+                           v_ok and v_n = 5 and v_r is null, v_r);
+
+    -- 33. The trip checklist facts match the seed: Meera's attendance (72%) is
+    --     short, Ishita's confirmed case clears conduct, Vikram holds a badge
+    --     from before the deadline, Priya has none yet.
+    v_ok := not (v_snap -> 'meera' ->> 'attendance_ok')::boolean
+      and (v_snap -> 'meera' ->> 'registered_ok')::boolean
+      and (v_snap -> 'meera' ->> 'conduct_ok')::boolean
+      and not (v_snap -> 'ishita' ->> 'conduct_ok')::boolean
+      and not (v_snap -> 'ishita' ->> 'badge_by_deadline')::boolean
+      and v_snap -> 'ishita' ->> 'list' is null
+      and (v_snap -> 'vikram' ->> 'badge_by_deadline')::boolean
+      and (v_snap -> 'vikram' ->> 'attendance_ok')::boolean
+      and v_snap -> 'vikram' ->> 'list' = 'Qualiflyers'
+      and not (v_snap -> 'priya' ->> 'badge_by_deadline')::boolean;
+    perform pg_temp.report(33, 'Trip checklist facts match the seed (attendance, conduct, badge by deadline)',
+                           coalesce(v_ok, false));
 
     -- Keep the results, then undo everything the checks did.
     select jsonb_agg(to_jsonb(r) order by r.check_no) into v_out from grit_check_results r;

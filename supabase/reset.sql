@@ -1,6 +1,6 @@
 -- =============================================================================
 -- GRIT Layover - reset.sql
--- DESTROYS ALL GRIT DATA. Drops every object created by 001-004 so the
+-- DESTROYS ALL GRIT DATA. Drops every object created by 001-005 so the
 -- migrations and seed can be run again from scratch.
 --
 -- Dropping tables is the only way to clear the insert-only tables: their
@@ -10,7 +10,8 @@
 
 begin;
 
--- Tables (CASCADE also drops the views and the functions that take a table row type).
+-- Tables (CASCADE also drops every view, including 005's, and the functions that
+-- take a table row type).
 drop table if exists
   audit_log, malpractice_cases, miles_ledger, badge_awards, project_submissions,
   interview_results, bookings, slots, skill_results, badge_requirements, badges,
@@ -35,7 +36,12 @@ begin
         'record_skill_result', 'create_slot', 'book_slot', 'cancel_booking',
         'reschedule_booking', 'withdraw_slot', 'record_result', 'correct_result',
         'flag_malpractice', 'decide_case', 'restore_eligibility', 'submit_project', 'review_project',
-        'admin_list_cases', 'admin_audit_log'])
+        'admin_list_cases', 'admin_audit_log',
+        -- 005_app_reads.sql
+        '_require_self_or_admin', '_standing', 'student_overview', 'student_passbook',
+        'student_requirements', 'student_projects', 'student_bookings', 'student_timeline',
+        'student_last_change', 'interviewer_slots', 'interviewer_results',
+        'project_review_queue', 'admin_active_awards'])
   loop
     execute format('drop function %s cascade', f);
   end loop;

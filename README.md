@@ -17,6 +17,7 @@ derives instead of storing. See [docs/data-model.md](docs/data-model.md).
 | `supabase/migrations/002_functions.sql` | Guard + audit triggers, business functions (the only write path) |
 | `supabase/migrations/003_views.sql` | `student_journey`, `leaderboard`, admin and interviewer views |
 | `supabase/migrations/004_security.sql` | Grants and Row Level Security |
+| `supabase/migrations/005_app_reads.sql` | Read-only views and functions for the app's screens (passbook, trip checklist, "what changed", ...) |
 | `supabase/seed.sql` | GRIT reference data + one demo student per journey state |
 | `supabase/tests/checks.sql` | Rule checks; prints a PASS/FAIL table and rolls everything back |
 | `supabase/reset.sql` | Drops all GRIT objects (destroys data) |
@@ -30,13 +31,14 @@ Paste and run each file, **in this order**:
 2. `supabase/migrations/002_functions.sql`
 3. `supabase/migrations/003_views.sql`
 4. `supabase/migrations/004_security.sql`
-5. `supabase/seed.sql`
-6. `supabase/tests/checks.sql`: every row should say `PASS`
+5. `supabase/migrations/005_app_reads.sql`
+6. `supabase/seed.sql`
+7. `supabase/tests/checks.sql`: every row should say `PASS`
 
 Or with psql:
 
 ```sh
-for f in supabase/migrations/00{1,2,3,4}_*.sql supabase/seed.sql supabase/tests/checks.sql; do
+for f in supabase/migrations/00{1,2,3,4,5}_*.sql supabase/seed.sql supabase/tests/checks.sql; do
   psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f "$f" || break
 done
 ```
@@ -55,7 +57,7 @@ show "Not eligible".
 1. Run `supabase/reset.sql`. **This deletes all GRIT data.** It drops the
    tables, views, functions and domains. Dropping is the only way to clear
    the ledger, because its guard triggers block DELETE and TRUNCATE by design.
-2. Run steps 1 to 6 above again.
+2. Run steps 1 to 7 above again.
 
 ## Regenerate the data-model doc
 
@@ -70,7 +72,8 @@ There is no login yet. The app's role switcher passes `p_actor_role` /
 but they trust the caller about who they are. `anon` and `authenticated` can:
 
 - read the reference tables and the views
-- call the public functions
+- call the public functions, including the read functions in `005_app_reads.sql`
+  (a student may read only their own data, an interviewer theirs, an admin anyone's)
 
 They cannot write to any table, and they cannot read `malpractice_cases` or
 `audit_log` (admins use `admin_list_cases()` / `admin_audit_log()`).
