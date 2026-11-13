@@ -5,10 +5,12 @@
 --
 -- Conventions
 --   * Business functions are SECURITY DEFINER with a pinned search_path.
---   * Every business function takes p_actor_role / p_actor_id. They are copied
---     into settings (app.actor_role / app.actor_id) that the audit trigger
---     reads, scoped to the function call by a function-level SET clause. Parameter order: required business args, then the
---     actor, then optional args (Postgres needs defaults last).
+--   * Every business function takes p_actor_role / p_actor_id, hands them to
+--     the audit trigger with _set_actor(), and puts the previous actor back
+--     with _restore_actor() before returning, so each call is credited on its
+--     own (see "Actor context" below).
+--   * Parameter order: required business args, then the actor, then optional
+--     args (Postgres needs defaults last).
 --   * Errors are plain sentences: the app shows them to users as-is.
 --   * Functions whose name starts with "_" are internal and not granted to
 --     anon/authenticated (see 004).
@@ -67,11 +69,25 @@ comment on function student_ineligibility_reason(students) is 'Why a student may
 
 -- -----------------------------------------------------------------------------
 -- Actor context
+-- The audit trigger reads the acting user from two settings. Every public
+-- business function brackets its work like this:
+--     v_prev_actor := _set_actor(p_actor_role, p_actor_id);   -- first line
+--     ...
+--     perform _restore_actor(v_prev_actor);                    -- before return
+-- so the actor is scoped to that one call: SQL that runs later in the same
+-- transaction is not credited to whoever called the last function. If the
+-- function raises, Postgres rolls the settings back with everything else.
+-- (A function-level "SET app.actor_role = ..." clause would do this
+-- automatically, but Supabase's non-superuser role may not use custom
+-- parameters in SET clauses.)
 -- -----------------------------------------------------------------------------
-create function _set_actor(p_actor_role text, p_actor_id text) returns void
+create function _set_actor(p_actor_role text, p_actor_id text) returns text[]
 language plpgsql
 set search_path = public, pg_temp
 as $$
+declare
+  v_previous text[] := array[current_setting('app.actor_role', true),
+                             current_setting('app.actor_id', true)];
 begin
   if p_actor_role is null or p_actor_role not in ('student', 'interviewer', 'admin', 'system') then
     raise exception using message = format('Unknown role "%s". Use student, interviewer, admin or system.', p_actor_role);
@@ -79,16 +95,26 @@ begin
   if p_actor_role <> 'system' and coalesce(btrim(p_actor_id), '') = '' then
     raise exception 'Please choose who you are acting as before making changes.';
   end if;
-  -- is_local = true keeps the values from leaking between requests on a pooled
-  -- connection. Every public business function also declares
-  -- "SET app.actor_role = 'system'", so the actor is scoped to that one call:
-  -- direct SQL later in the same transaction is logged as 'system', not as
-  -- whoever called the last function.
+  -- is_local = true: the values never outlive the transaction, so nothing
+  -- leaks between requests on a pooled connection.
   perform set_config('app.actor_role', p_actor_role, true);
   perform set_config('app.actor_id', coalesce(p_actor_id, ''), true);
+  return v_previous;
 end;
 $$;
-comment on function _set_actor(text, text) is 'Validates the acting role and stores it for the audit trigger (transaction-local).';
+comment on function _set_actor(text, text) is
+  'Validates the acting role, stores it for the audit trigger (transaction-local) and returns the previous actor.';
+
+create function _restore_actor(p_previous text[]) returns void
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  perform set_config('app.actor_role', coalesce(p_previous[1], ''), true);
+  perform set_config('app.actor_id', coalesce(p_previous[2], ''), true);
+end;
+$$;
+comment on function _restore_actor(text[]) is 'Puts back the actor that _set_actor() replaced.';
 
 create function _require_role(p_actor_role text, variadic p_allowed text[]) returns void
 language plpgsql immutable
@@ -301,18 +327,18 @@ create function record_skill_result(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
-declare v_id uuid;
+declare
+  v_prev_actor text[];
+  v_id         uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'system', 'admin');
 
   insert into skill_results (student_id, skill_id, level, medal, miles, attempted_at)
   values (p_student, p_skill, p_level, p_medal, p_miles, p_attempted_at)
   returning id into v_id;
+  perform _restore_actor(v_prev_actor);
   return v_id;
 end;
 $$;
@@ -329,15 +355,13 @@ create function create_slot(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
+  v_prev_actor  text[];
   v_interviewer interviewers;
-  v_id uuid;
+  v_id          uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer', 'admin');
   if p_actor_role = 'interviewer' and p_actor_id <> p_interviewer::text then
     raise exception 'Interviewers can only create their own slots.';
@@ -356,6 +380,7 @@ begin
   exception when exclusion_violation then
     raise exception using message = format('You already have an open slot overlapping %s.', format_ist(p_starts_at));
   end;
+  perform _restore_actor(v_prev_actor);
   return v_id;
 end;
 $$;
@@ -527,19 +552,21 @@ create function book_slot(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
+declare
+  v_prev_actor text[];
+  v_booking_id uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'student', 'admin');
   if p_actor_role = 'student' and p_actor_id <> p_student::text then
     raise exception 'Students can only book interviews for themselves.';
   end if;
   -- An open malpractice case deliberately does NOT block booking: badges
   -- "count but hold" - only final decisions wait for the case.
-  return _create_booking(p_student, p_badge, p_slot, null);
+  v_booking_id := _create_booking(p_student, p_badge, p_slot, null);
+  perform _restore_actor(v_prev_actor);
+  return v_booking_id;
 end;
 $$;
 comment on function book_slot(uuid, uuid, uuid, text, text) is
@@ -567,15 +594,13 @@ create function cancel_booking(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_booking bookings;
-  v_slot    slots;
+  v_prev_actor text[];
+  v_booking    bookings;
+  v_slot       slots;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'student', 'interviewer', 'admin');
   if coalesce(btrim(p_reason), '') = '' then raise exception 'Please give a reason for cancelling.'; end if;
 
@@ -597,6 +622,7 @@ begin
   end if;
 
   perform _cancel_booking(v_booking, p_actor_role, p_reason);
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function cancel_booking(uuid, text, text, text) is
@@ -613,15 +639,14 @@ create function reschedule_booking(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_booking bookings;
-  v_slot    slots;
+  v_prev_actor text[];
+  v_booking    bookings;
+  v_slot       slots;
+  v_new_id     uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'student', 'admin');
 
   select * into v_booking from bookings where id = p_booking for update;
@@ -642,7 +667,9 @@ begin
 
   -- Cancel first so the "one active booking per badge" rule lets the new one in.
   perform _cancel_booking(v_booking, p_actor_role, 'Rescheduled');
-  return _create_booking(v_booking.student_id, v_booking.badge_id, p_new_slot, v_booking.id);
+  v_new_id := _create_booking(v_booking.student_id, v_booking.badge_id, p_new_slot, v_booking.id);
+  perform _restore_actor(v_prev_actor);
+  return v_new_id;
 end;
 $$;
 comment on function reschedule_booking(uuid, uuid, text, text) is
@@ -658,15 +685,13 @@ create function withdraw_slot(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_slot    slots;
-  v_booking bookings;
+  v_prev_actor text[];
+  v_slot       slots;
+  v_booking    bookings;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer', 'admin');
   if p_actor_role = 'interviewer' and p_actor_id <> p_interviewer::text then
     raise exception 'Interviewers can only withdraw their own slots.';
@@ -689,6 +714,7 @@ begin
                             case p_actor_role when 'interviewer' then 'interviewer' else 'admin' end,
                             'Slot withdrawn: ' || p_reason);
   end loop;
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function withdraw_slot(uuid, uuid, text, text, text) is
@@ -835,17 +861,15 @@ create function record_result(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_booking   bookings;
-  v_slot      slots;
-  v_held_at   timestamptz;
-  v_result_id uuid;
+  v_prev_actor text[];
+  v_booking    bookings;
+  v_slot       slots;
+  v_held_at    timestamptz;
+  v_result_id  uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer');
   if p_actor_id <> p_interviewer::text then
     raise exception 'You can only record results as yourself.';
@@ -887,6 +911,7 @@ begin
   if p_outcome = 'pass' then
     perform _grant_award(v_result_id);  -- award dated interview_held_at, + bonus Miles
   end if;
+  perform _restore_actor(v_prev_actor);
   return v_result_id;
 end;
 $$;
@@ -904,17 +929,15 @@ create function correct_result(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
+  v_prev_actor   text[];
   v_result       interview_results;
   v_award        uuid;
   v_booking      bookings;
   v_retake_after date;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer', 'admin');
   if coalesce(btrim(p_reason), '') = '' then raise exception 'Please give a reason for the correction.'; end if;
   if p_new_outcome is null or p_new_outcome not in ('pass', 'fail', 'retake_later', 'no_show', 'technical_issue') then
@@ -973,6 +996,7 @@ begin
     end loop;
     perform _grant_award(p_result);
   end if;
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function correct_result(uuid, text, text, text, text, date) is
@@ -988,15 +1012,13 @@ create function flag_malpractice(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_award badge_awards;
-  v_id    uuid;
+  v_prev_actor text[];
+  v_award      badge_awards;
+  v_id         uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer', 'admin');
   if coalesce(btrim(p_evidence), '') = '' then raise exception 'Please describe the evidence.'; end if;
 
@@ -1012,6 +1034,7 @@ begin
   exception when unique_violation then
     raise exception 'There is already an open case for this badge.';
   end;
+  perform _restore_actor(v_prev_actor);
   return v_id;
 end;
 $$;
@@ -1025,14 +1048,12 @@ create function decide_case(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_case malpractice_cases;
+  v_prev_actor text[];
+  v_case       malpractice_cases;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'admin');
   if p_decision is null or p_decision not in ('confirmed', 'dismissed') then
     raise exception 'Decision must be confirmed or dismissed.';
@@ -1057,6 +1078,7 @@ begin
     update students set conduct_ok = false where id = v_case.student_id;
   end if;
   -- dismissed: nothing else changes; the case stays on record.
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function decide_case(uuid, text, text, text, text) is
@@ -1074,15 +1096,13 @@ create function restore_eligibility(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
 declare
-  v_student students;
-  v_cases   int;
+  v_prev_actor text[];
+  v_student    students;
+  v_cases      int;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'admin');
   if coalesce(btrim(p_note), '') = '' then
     raise exception 'Please add a note explaining why eligibility is being restored.';
@@ -1105,6 +1125,7 @@ begin
   end if;
 
   update students set conduct_ok = true where id = p_student;
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function restore_eligibility(uuid, text, text, text) is
@@ -1120,13 +1141,12 @@ create function submit_project(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
-declare v_id uuid;
+declare
+  v_prev_actor text[];
+  v_id         uuid;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'student', 'admin');
   if p_actor_role = 'student' and p_actor_id <> p_student::text then
     raise exception 'Students can only submit their own projects.';
@@ -1145,6 +1165,7 @@ begin
   exception when unique_violation then
     raise exception 'You already have a project submitted or approved for this badge.';
   end;
+  perform _restore_actor(v_prev_actor);
   return v_id;
 end;
 $$;
@@ -1158,13 +1179,12 @@ create function review_project(
 language plpgsql
 security definer
 set search_path = public, pg_temp
--- Actor scope: restored to its previous value when this function returns.
-set app.actor_role = 'system'
-set app.actor_id = ''
 as $$
-declare v_sub project_submissions;
+declare
+  v_prev_actor text[];
+  v_sub        project_submissions;
 begin
-  perform _set_actor(p_actor_role, p_actor_id);
+  v_prev_actor := _set_actor(p_actor_role, p_actor_id);
   perform _require_role(p_actor_role, 'interviewer', 'admin');
   if p_decision is null or p_decision not in ('approved', 'rejected') then
     raise exception 'Decision must be approved or rejected.';
@@ -1180,6 +1200,7 @@ begin
      set status = p_decision, reviewed_at = now(), review_note = p_note,
          reviewed_by = case when p_actor_role = 'interviewer' then p_actor_id::uuid end
    where id = p_submission;
+  perform _restore_actor(v_prev_actor);
 end;
 $$;
 comment on function review_project(uuid, text, text, text, text) is 'Approves or rejects a submitted project.';

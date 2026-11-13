@@ -111,6 +111,7 @@ declare
   v_award2     uuid;
   v_case       uuid;
   v_deadline   date;
+  v_probe      uuid;
 begin
   if v_priya is null then
     raise exception 'Seed data not found. Run supabase/seed.sql before the checks.';
@@ -475,6 +476,17 @@ begin
                              and cancel_reason = 'Earlier badge (Novice) was revoked'
                       from bookings where student_id = v_sneha and badge_id = v_specialist);
     perform pg_temp.report(25, 'Revoking a badge cancels higher-badge bookings in the track', coalesce(v_ok, false));
+
+    -- 26. The audit actor is scoped to one function call: SQL that runs
+    --     afterwards in the same transaction is credited to 'system', not to
+    --     whoever called the last function.
+    v_id := create_slot(v_tester, now() + interval '20 days', 'interviewer', v_tester::text);
+    insert into interviewers (name, email) values ('Audit Probe', 'probe@grit.example') returning id into v_probe;
+    v_ok := (select actor_role = 'interviewer' and actor_id = v_tester::text
+             from audit_log where table_name = 'slots' and action = 'INSERT' and record_id = v_id::text)
+        and (select actor_role = 'system' and actor_id is null
+             from audit_log where table_name = 'interviewers' and action = 'INSERT' and record_id = v_probe::text);
+    perform pg_temp.report(26, 'Audit actor is scoped to each function call', coalesce(v_ok, false));
 
     -- Keep the results, then undo everything the checks did.
     select jsonb_agg(to_jsonb(r) order by r.check_no) into v_out from grit_check_results r;

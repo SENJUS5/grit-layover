@@ -28,7 +28,7 @@ begin
     where n.nspname = 'public'
       and p.proname = any (array[
         'ist_date', 'ist_today', 'format_ist', 'student_ineligibility_reason',
-        '_set_actor', '_require_role', '_forbid_update_delete', '_forbid_delete',
+        '_set_actor', '_restore_actor', '_require_role', '_forbid_update_delete', '_forbid_delete',
         '_touch_updated_at', '_check_level_within_skill', '_credit_skill_miles',
         '_set_case_review_due', '_audit_row', '_create_booking', '_cancel_booking',
         '_grant_award', '_revoke_award', '_retake_date',
