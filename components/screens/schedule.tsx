@@ -283,7 +283,7 @@ function RecordedResult(props: { result: InterviewerResult; interviewer: Actor; 
               again any time.
             </p>
           )}
-          <Field label="Reason for the correction" hint="The student will see this reason.">
+          <Field label="Reason for the correction" hint="The student may see this reason.">
             <input className={inputClass} value={reason} onChange={(e) => setReason(e.target.value)} />
           </Field>
           {cooldown && (
