@@ -3,7 +3,7 @@
 import { Info, Mail, Plane } from "lucide-react";
 import { Fragment, useEffect, useState } from "react";
 import { RoleGate } from "@/components/role-gate";
-import { Card, Empty, ErrorNote, Loading, PageHeader, Pill } from "@/components/ui";
+import { ButtonLink, Card, Empty, ErrorNote, Loading, PageHeader, Pill } from "@/components/ui";
 import { markMessagesSeen, readSeen, useMessages } from "@/lib/inbox";
 import { SUPPORT_EMAIL, type Message } from "@/lib/messages";
 import { formatDateTime } from "@/lib/time";
@@ -62,6 +62,11 @@ function MessageCard({ message: m, isNew }: { message: Message; isNew: boolean }
             <p key={i}>{line}</p>
           ))}
         </div>
+        {m.action && (
+          <ButtonLink href={m.action.href} variant="secondary" className="mt-4">
+            {m.action.label}
+          </ButtonLink>
+        )}
         {m.note && <p className="mt-3 border-t border-line pt-3 text-sm text-muted">{withEmailLink(m.note)}</p>}
       </article>
     </Card>

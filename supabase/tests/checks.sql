@@ -18,6 +18,9 @@
 --     and the partial unique index, which a single script cannot race.
 --   * Check 12 backdates recorded_at by one day, because now() cannot be moved
 --     inside a transaction.
+--   * Check 34 sends the same correction twice, one after the other. Two calls
+--     arriving at the same moment are serialised by correct_result's row lock
+--     (select ... for update), so the second still sees the first's outcome.
 -- =============================================================================
 
 create temp table if not exists grit_check_results (
@@ -670,6 +673,23 @@ begin
       and not (v_snap -> 'priya' ->> 'badge_by_deadline')::boolean;
     perform pg_temp.report(33, 'Trip checklist facts match the seed (attendance, conduct, badge by deadline)',
                            coalesce(v_ok, false));
+
+    -- 34. A double-click cannot correct a result twice. Karthik corrects
+    --     Rahul's result (recorded in check 30) to retake_later; the same call
+    --     arrives again and is refused, leaving the result and Miles as they were.
+    select id into v_result from interview_results where student_id = v_rahul and badge_id = v_novice;
+    perform correct_result(v_result, 'retake_later', 'Asked for a retake after a second look', 'interviewer', v_karthik::text);
+    select to_jsonb(r) into v_before from interview_results r where r.id = v_result;
+    v_n := pg_temp.miles(v_rahul);
+    v_r := pg_temp.expect_error(
+      format('select correct_result(%L, %L, %L, %L, %L)',
+             v_result, 'retake_later', 'Asked for a retake after a second look', 'interviewer', v_karthik),
+      'The result is already "retake_later"');
+    perform pg_temp.report(34, 'The same correction sent twice is refused the second time and changes nothing',
+      v_r like 'OK:%'
+        and (select to_jsonb(r) from interview_results r where r.id = v_result) = v_before
+        and pg_temp.miles(v_rahul) = v_n,
+      v_r);
 
     -- Keep the results, then undo everything the checks did.
     select jsonb_agg(to_jsonb(r) order by r.check_no) into v_out from grit_check_results r;

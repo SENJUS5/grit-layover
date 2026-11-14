@@ -11,6 +11,7 @@ import { standing } from "./labels";
 import { formatDate, formatDay, formatDeadline } from "./time";
 import type { JourneyRow, Overview, TimelineEvent } from "./types";
 
+// Real GRIT support address from GRIT Terms & Conditions, clause 16.8 (data errors).
 export const SUPPORT_EMAIL = "niat.grit@nxtwave.tech";
 
 export type Message = {
@@ -20,6 +21,8 @@ export type Message = {
   at: string;
   tone: "good" | "neutral" | "care";
   body: string[];
+  /** A button under the text. */
+  action?: { href: string; label: string };
   /** Small print under the message. */
   note?: string;
 };
@@ -29,6 +32,9 @@ export const TITLES = {
   onTheWay: "Your result is on the way",
   removed: "Your badge has been removed",
 };
+
+/** Under a didn't-pass or technical-issue result, while the student can book that badge right now. */
+export const OPEN_SLOTS = { href: "/interviews", label: "See open slots" };
 
 /** Private notice on the student's own Dashboard while a case is open (never on public screens). */
 export const UNDER_REVIEW_NOTICE = {
@@ -62,23 +68,38 @@ function passed(ev: TimelineEvent, ctx: Context): string[] {
   return lines;
 }
 
-function notPassed(ev: TimelineEvent): string[] {
+function notPassed(ev: TimelineEvent, ctx: Context): string[] {
   const badge = `${ev.track} ${ev.levels[0]}`;
-  const opening =
-    ev.outcome === "no_show"
-      ? `We missed you at your ${badge} interview on ${formatDate(ev.interview_held_at!)}.`
-      : ev.outcome === "retake_later"
+  const held = formatDate(ev.interview_held_at!);
+  // The student waits only while the retake date is still ahead: the same test
+  // the database uses to refuse a booking (retake_after > IST today). A
+  // corrected pass and a technical issue have no retake date at all.
+  const retakeFrom = ev.retake_after && ev.retake_after > ctx.today ? ev.retake_after : null;
+  const later = ev.outcome === "retake_later" && retakeFrom !== null;
+
+  const opening = ev.corrected
+    ? `Your result for ${badge} was corrected. ` +
+      (ev.outcome === "no_show"
+        ? `It now shows that you missed the interview on ${held}.`
+        : later
+          ? "Your interviewer would like you to try again a little later."
+          : "You didn't pass this time.")
+    : ev.outcome === "no_show"
+      ? `We missed you at your ${badge} interview on ${held}.`
+      : later
         ? `Your interviewer would like you to try ${badge} again a little later.`
         : `You didn't pass ${badge} this time.`;
+
   const lines = [opening];
   if (ev.feedback) lines.push(`Feedback from your interviewer: "${ev.feedback}"`);
-  if (ev.corrected && ev.correction_reason) lines.push(`This result was corrected: ${ev.correction_reason}`);
+  if (ev.corrected && ev.correction_reason) lines.push(`Reason for the correction: ${ev.correction_reason}`);
+  lines.push(retakeFrom ? `You can book again from ${formatDay(retakeFrom, true)}.` : "You can book again any time.");
+  // "Use the time" needs a wait, and "the points above" needs feedback.
   lines.push(
-    ev.retake_after
-      ? `You can book again from ${formatDay(ev.retake_after, true)}.`
-      : "You can book again any time.",
+    retakeFrom && ev.feedback
+      ? "Your skill Miles and cleared skills stay as they are. Use the time to practise the points above."
+      : "Your skill Miles and cleared skills stay as they are.",
   );
-  lines.push("Your Miles and cleared skills stay as they are. Use the time to practise the points above.");
   return lines;
 }
 
@@ -148,7 +169,11 @@ function removed(ev: TimelineEvent, ctx: Context): string[] {
 
 type Context = {
   overview: Overview | null;
+  /** Today in India time ("YYYY-MM-DD"). */
+  today: string;
   stillHeld: (ev: TimelineEvent) => boolean;
+  /** The badge's journey state is "Ready to book": the student can book it right now. */
+  canBookNow: (ev: TimelineEvent) => boolean;
 };
 
 const tripDone = (o: Overview) =>
@@ -159,13 +184,18 @@ export function buildMessages(input: {
   overview: Overview | null;
   journey: JourneyRow[];
   timeline: TimelineEvent[];
+  /** Today in India time ("YYYY-MM-DD"). */
+  today: string;
 }): Message[] {
   const ctx: Context = {
     overview: input.overview,
+    today: input.today,
     stillHeld: (ev) =>
       input.journey.some(
         (j) => j.track === ev.track && j.level === ev.levels[0] && (j.state === "Passed" || j.state === "Under review"),
       ),
+    canBookNow: (ev) =>
+      input.journey.some((j) => j.track === ev.track && j.level === ev.levels[0] && j.state === "Ready to book"),
   };
 
   const messages: Message[] = [];
@@ -181,13 +211,14 @@ export function buildMessages(input: {
       });
     } else if (ev.outcome) {
       const body =
-        ev.outcome === "pass" ? passed(ev, ctx) : ev.outcome === "technical_issue" ? technicalIssue(ev) : notPassed(ev);
+        ev.outcome === "pass" ? passed(ev, ctx) : ev.outcome === "technical_issue" ? technicalIssue(ev) : notPassed(ev, ctx);
       messages.push({
         id: `result:${ev.track}:${ev.levels[0]}:${ev.interview_held_at}`,
         title: TITLES.result,
         at: ev.happened_at,
         tone: ev.outcome === "pass" ? "good" : "neutral",
         body,
+        action: ev.outcome !== "pass" && ctx.canBookNow(ev) ? OPEN_SLOTS : undefined,
       });
     }
   }

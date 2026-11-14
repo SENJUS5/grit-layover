@@ -4,7 +4,9 @@ import { useSyncExternalStore } from "react";
 import useSWR from "swr";
 import * as api from "./api";
 import { buildMessages } from "./messages";
+import { istDay } from "./time";
 import type { Actor } from "./types";
+import { useNow } from "./use-now";
 
 // The "new" dot on Messages. Messages are computed from data, so "read" is
 // simply the newest message time this browser has seen, kept in localStorage.
@@ -40,9 +42,19 @@ export function useMessages(actor: Actor | null) {
   const overview = useSWR(id ? ["overview", id] : null, () => api.studentOverview(actor!, id!));
   const journey = useSWR(id ? ["journey", id] : null, () => api.getJourney(id!));
   const timeline = useSWR(id ? ["timeline", id] : null, () => api.studentTimeline(actor!, id!));
-  const ready = overview.data !== undefined && journey.data && timeline.data;
+  // Today's date decides whether a retake date is still ahead. Like the data,
+  // it is only known in the browser (null during the server render).
+  const now = useNow();
+  const ready = now !== null && overview.data !== undefined && journey.data && timeline.data;
   return {
-    messages: ready ? buildMessages({ overview: overview.data ?? null, journey: journey.data!, timeline: timeline.data! }) : undefined,
+    messages: ready
+      ? buildMessages({
+          overview: overview.data ?? null,
+          journey: journey.data!,
+          timeline: timeline.data!,
+          today: istDay(now!),
+        })
+      : undefined,
     error: overview.error ?? journey.error ?? timeline.error,
   };
 }

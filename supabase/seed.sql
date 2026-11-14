@@ -190,10 +190,11 @@ end;
 $$;
 
 -- A past interview: slot + booking inserted directly (book_slot rejects the
--- past by design), then the result goes through record_result.
+-- past by design), then the result and the interviewer's feedback go through
+-- record_result.
 create function pg_temp.past_interview(
   p_student text, p_track text, p_level text, p_interviewer text,
-  p_starts_at timestamptz, p_outcome text default null
+  p_starts_at timestamptz, p_outcome text default null, p_feedback text default null
 ) returns uuid language plpgsql as $$
 declare
   v_slot uuid;
@@ -207,8 +208,7 @@ begin
   values (pg_temp.student(p_student), pg_temp.badge(p_track, p_level), v_slot, p_starts_at - interval '3 days')
   returning id into v_booking;
   if p_outcome is not null then
-    perform record_result(v_booking, v_interviewer, p_outcome,
-                          format('Seeded %s interview', p_outcome),
+    perform record_result(v_booking, v_interviewer, p_outcome, p_feedback,
                           'interviewer', v_interviewer::text);
   end if;
   return v_booking;
@@ -281,12 +281,14 @@ select pg_temp.attempt('Kavya Nair', 'UI Engineering', 2, 'gold', 15);
 select pg_temp.attempt('Kavya Nair', 'CS Fundamentals', 1, 'gold', 15);
 select pg_temp.attempt('Kavya Nair', 'Applied Gen AI Development', 1, 'gold', 15);
 select pg_temp.past_interview('Kavya Nair', 'AI Product Mastery', 'Novice', 'Ananya Rao',
-                              pg_temp.ist_at(-2, time '11:00'), 'fail');
+                              pg_temp.ist_at(-2, time '11:00'), 'fail',
+                              'Good start, but the demo didn''t handle edge cases. Practise explaining your design choices.');
 
 -- Vikram -> Passed (qualiflyer).
 select pg_temp.product_novice_skills('Vikram Singh', 25);
 select pg_temp.past_interview('Vikram Singh', 'AI Product Mastery', 'Novice', 'Karthik Menon',
-                              pg_temp.ist_at(-10, time '10:30'), 'pass');
+                              pg_temp.ist_at(-10, time '10:30'), 'pass',
+                              'Clear problem framing and a working demo. Good answers on trade-offs.');
 
 -- Meera -> Not eligible: attendance 72%.
 select pg_temp.product_novice_skills('Meera Joshi', 18);
@@ -295,7 +297,8 @@ select pg_temp.product_novice_skills('Meera Joshi', 18);
 -- Still ranks normally on the leaderboard.
 select pg_temp.product_novice_skills('Aditya Kulkarni', 22);
 select pg_temp.past_interview('Aditya Kulkarni', 'AI Product Mastery', 'Novice', 'Ananya Rao',
-                              pg_temp.ist_at(-8, time '12:00'), 'pass');
+                              pg_temp.ist_at(-8, time '12:00'), 'pass',
+                              'Strong user story and a clean demo. You explained clearly how you''d measure success.');
 select flag_malpractice(
   (select id from badge_awards where student_id = pg_temp.student('Aditya Kulkarni') and status = 'active'),
   'Second screen visible during the live coding round.',
@@ -316,9 +319,11 @@ select submit_project(pg_temp.student('Rohan Das'), pg_temp.badge('AI Robotics M
 select pg_temp.product_novice_skills('Ishita Gupta', 40);
 select pg_temp.product_specialist_skills('Ishita Gupta', 25);
 select pg_temp.past_interview('Ishita Gupta', 'AI Product Mastery', 'Novice', 'Karthik Menon',
-                              pg_temp.ist_at(-30, time '10:00'), 'pass');
+                              pg_temp.ist_at(-30, time '10:00'), 'pass',
+                              'Focused scope and a smooth end-to-end demo. Good use of user feedback in your design.');
 select pg_temp.past_interview('Ishita Gupta', 'AI Product Mastery', 'Specialist', 'Ananya Rao',
-                              pg_temp.ist_at(-12, time '11:30'), 'pass');
+                              pg_temp.ist_at(-12, time '11:30'), 'pass',
+                              'Thoughtful evaluation plan and a realistic view of latency and cost. Confident answers to follow-up questions.');
 select flag_malpractice(
   (select a.id from badge_awards a
    where a.student_id = pg_temp.student('Ishita Gupta')
